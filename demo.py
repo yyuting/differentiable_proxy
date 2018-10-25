@@ -943,8 +943,8 @@ def main_network(args):
             loss_record = numpy.zeros(len(val_names))
             iters_used = numpy.zeros(len(val_names))
             parameters_stored = numpy.zeros([len(val_names), args.input_nc])
+            convergence_single = numpy.empty(niters)
             for ind in range(len(val_names)):
-                idx = 0
                 feed_dict = {}
                 if args.preload:
                     input_image = eval_images[ind]
@@ -956,34 +956,51 @@ def main_network(args):
                     continue
                 feed_dict[input] = input_image
                 feed_dict[output] = output_image
-                x0 = numpy.random.rand(args.input_nc)
-                if args.orig_program_name == 'local_laplacian_tf':
-                    x0[2] *= 0.1
-                if optimizer is not None:
-                    sess.run(tf.assign(input_parameters, x0))
+                nrestarts = 3
+                min_current = 1e8
+                min_current_iters = -1
+                for _ in range(nrestarts):
+                    idx = 0
+                    convergence_single[:] = -1
+                    x0 = numpy.random.rand(args.input_nc)
+                    if args.orig_program_name == 'local_laplacian_tf':
+                        x0[2] *= 0.1
+                    if optimizer is not None:
+                        sess.run(tf.assign(input_parameters, x0))
+                    if optimizer is None:
+                        objective = scipy_objective_functor(feed_dict)
+                        res = scipy.optimize.minimize(objective, x0, method=args.optimizer, callback=loss_callback_functor(convergence_single, True, objective), options={'disp': True, 'maxiter': niters})
+                        print(res)
+                        iters_used[ind] = idx
+                    elif regular_optimize:
+                        for i in range(niters):
+                            _, current = sess.run([opt, loss], feed_dict=feed_dict)
+                            print(i, current * 255 * 255)
+                            convergence_single[i] = current * 255 * 255
+                            #convergence[ind, i] = current * 255 * 255
+                        iters_used[ind] = i
+                    else:
+                        optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback_functor(convergence_single))
+                        iters_used[ind] = idx
+                    if optimizer is None:
+                        optimized_parameters = res.x
+                        feed_dict[input_parameters] = optimized_parameters
+                    else:
+                        optimized_parameters = sess.run(input_parameters, feed_dict=feed_dict)
+                    current = sess.run(loss, feed_dict=feed_dict)
+                    if current < min_current:
+                        min_current = current
+                        convergence[ind, :] = convergence_single[:]
+                        min_current_iters = iters_used[ind]
+                        parameters_stored[ind, :] = optimized_parameters[:]
+
                 if optimizer is None:
-                    objective = scipy_objective_functor(feed_dict)
-                    res = scipy.optimize.minimize(objective, x0, method=args.optimizer, callback=loss_callback_functor(convergence[ind, :], True, objective), options={'disp': True, 'maxiter': niters})
-                    print(res)
-                    iters_used[ind] = idx
-                elif regular_optimize:
-                    for i in range(niters):
-                        _, current = sess.run([opt, loss], feed_dict=feed_dict)
-                        print(i, current * 255 * 255)
-                        convergence[ind, i] = current * 255 * 255
-                    iters_used[ind] = i
+                    feed_dict[input_parameters] = parameters_stored[ind, :]
                 else:
-                    optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback_functor(convergence[ind, :]))
-                    iters_used[ind] = idx
-                if optimizer is None:
-                    optimized_parameters = res.x
-                    feed_dict[input_parameters] = optimized_parameters
-                else:
-                    optimized_parameters = sess.run(input_parameters, feed_dict=feed_dict)
-                img, current = sess.run([network, loss], feed_dict=feed_dict)
+                    sess.run(tf.assign(input_parameters, parameters_stored[ind, :]))
+                img = sess.run(network, feed_dict=feed_dict)
                 cv2.imwrite('%s/%06d.png'%(optimize_dirname, ind), np.uint8(np.clip(img[0, :, :, :], 0.0, 1.0) * 255.0))
-                loss_record[ind] = current * 255.0 * 255.0
-                parameters_stored[ind, :] = optimized_parameters[:]
+                loss_record[ind] = min_current * 255.0 * 255.0
             numpy.save('%s/convergence.npy'%(optimize_dirname), convergence)
             numpy.save('%s/loss_record.npy'%(optimize_dirname), loss_record)
             numpy.save('%s/iters_used.npy'%(optimize_dirname), iters_used)
