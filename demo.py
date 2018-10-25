@@ -16,7 +16,10 @@ import importlib.util
 import subprocess
 import shutil
 from local_laplacian_tf import local_laplacian_tf
+from local_laplacian import local_laplacian
 import skimage.io
+import scipy
+import scipy.optimize
 
 no_L1_reg_other_layers = True
 
@@ -87,7 +90,7 @@ dilation_clamp_large = False
 dilation_remove_layer = False
 dilation_threshold = 8
 
-def build(input, ini_id=True, regularizer_scale=0.0, final_layer_channels=-1, identity_initialize=False):
+def build(input, ini_id=True, regularizer_scale=0.0, final_layer_channels=-1, identity_initialize=False, grayscale=False):
     regularizer = None
     if not no_L1_reg_other_layers and regularizer_scale > 0.0:
         regularizer = slim.l1_regularizer(regularizer_scale)
@@ -122,7 +125,11 @@ def build(input, ini_id=True, regularizer_scale=0.0, final_layer_channels=-1, id
             net = slim.conv2d(net, final_layer_channels, [1, 1], rate=1, activation_fn=lrelu, normalizer_fn=nm, weights_initializer=identity_initializer(allow_map_to_less=True), scope='final_'+str(nlayer),weights_regularizer=regularizer)
 
     print('identity last layer?', identity_initialize and identity_output_layer)
-    net=slim.conv2d(net,3,[1,1],rate=1,activation_fn=None,scope='g_conv_last',weights_regularizer=regularizer, weights_initializer=identity_initializer(allow_map_to_less=True) if (identity_initialize and identity_output_layer) else tf.contrib.layers.xavier_initializer())
+    if not grayscale:
+        out_ch = 3
+    else:
+        out_ch = 1
+    net=slim.conv2d(net,out_ch,[1,1],rate=1,activation_fn=None,scope='g_conv_last',weights_regularizer=regularizer, weights_initializer=identity_initializer(allow_map_to_less=True) if (identity_initialize and identity_output_layer) else tf.contrib.layers.xavier_initializer())
     return net
 
 def prepare_data_root(dataroot, gradient_loss=False):
@@ -238,6 +245,10 @@ def main():
     parser.add_argument('--specific_par', dest='specific_par', default='', help='use specified parameter and input_img for inference')
     parser.add_argument('--inference_loss', dest='inference_loss', default='', help='for hyperparameter optimization, stores the proxy inference loss when using the ground truth parameters')
     parser.add_argument('--test_dirname', dest='test_dirname', default='', help='if specified, use this name for testing directory')
+    parser.add_argument('--no_input_img', dest='use_input_img', action='store_false', help='if specified, input only parameters')
+    parser.add_argument('--grayscale', dest='grayscale', action='store_true', help='if specified, output grayscale image instead of color image')
+    parser.add_argument('--multi_level_loss', dest='multi_level_loss', action='store_true', help='if specified, use a multiple level loss')
+    parser.add_argument('--orig_program_name', dest='orig_program_name', default='local_laplacian_tf', help='specify the original program name for optimization')
 
     parser.set_defaults(is_npy=False)
     parser.set_defaults(is_train=False)
@@ -301,6 +312,7 @@ def copy_option(args):
     delattr(new_args, 'specific_par')
     delattr(new_args, 'inference_loss')
     delattr(new_args, 'test_dirname')
+    delattr(new_args, 'orig_program_name')
     return new_args
 
 def main_network(args):
@@ -387,7 +399,10 @@ def main_network(args):
         if not os.path.exists(name):
             return None
         if not is_npy and not is_bin:
-            return np.float32(cv2.imread(name, -1)) / 255.0
+            arr = np.float32(cv2.imread(name, -1)) / 255.0
+            if len(arr.shape) < 3:
+                arr = numpy.expand_dims(arr, axis=2)
+            return arr
         elif is_npy:
             ans = np.load(name)
             return ans
@@ -398,23 +413,37 @@ def main_network(args):
 
     train_from_queue = False
 
-    input=tf.placeholder(tf.float32,shape=[None,None,None,3])
-    if args.optimize_hyperparameter:
+    niters = 150
+
+    if args.grayscale:
+        img_ch = 1
+    else:
+        img_ch = 3
+    input=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
+    output=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
+    if args.optimize_hyperparameter and (args.optimizer not in ['nelder-mead', 'powell']):
         ini_parameters = numpy.random.rand(args.input_nc)
         # a hack because eps is not correctly scaled during training
-        ini_parameters[2] *= 0.1
+        if args.orig_program_name == 'local_laplacian_tf':
+            ini_parameters[2] *= 0.1
         input_parameters = tf.Variable(ini_parameters, dtype=tf.float32, name='input_parameters')
     else:
         input_parameters = tf.placeholder(tf.float32, shape=args.input_nc)
     filled = []
     for i in range(args.input_nc):
-        filled.append(tf.expand_dims(tf.fill(tf.shape(input)[:3], input_parameters[i]), axis=3))
-    input_to_network = tf.concat([input]+filled, axis=3)
-    output=tf.placeholder(tf.float32,shape=[None,None,None,3])
+        filled.append(tf.expand_dims(tf.fill(tf.shape(output)[:3], input_parameters[i]), axis=3))
+    if args.use_input_img:
+        input_to_network = tf.concat([input]+filled, axis=3)
+    else:
+        input_to_network = tf.concat(filled, axis=3)
 
     with tf.control_dependencies([input_to_network]):
         if args.use_orig_program:
-            network = local_laplacian_tf(input, input_parameters[0], input_parameters[1], input_parameters[2])
+            if args.orig_program_name == 'local_laplacian_tf':
+                network = local_laplacian_tf(input, input_parameters[0], input_parameters[1], input_parameters[2])
+            elif args.orig_program_name == 'local_laplacian_categorical':
+                from local_laplacian_categorical import local_laplacian_categorical
+                network = local_laplacian_categorical(input, input_parameters[0], input_parameters[1], input_parameters[2], input_parameters[3], input_parameters[4])
             regularizer_loss = 0
             manual_regularize = 0
         elif not args.unet:
@@ -457,7 +486,7 @@ def main_network(args):
                     for nlayer in range(3):
                         input_to_network = slim.conv2d(input_to_network, actual_initial_layer_channels, [1, 1], rate=1, activation_fn=lrelu, normalizer_fn=nm, weights_initializer=identity_initializer(), scope='initial_'+str(nlayer), weights_regularizer=regularizer)
 
-            network=build(input_to_network, ini_id, regularizer_scale=args.regularizer_scale, final_layer_channels=args.final_layer_channels, identity_initialize=args.identity_initialize)
+            network=build(input_to_network, ini_id, regularizer_scale=args.regularizer_scale, final_layer_channels=args.final_layer_channels, identity_initialize=args.identity_initialize, grayscale=args.grayscale)
 
         else:
             with tf.variable_scope("unet"):
@@ -477,6 +506,15 @@ def main_network(args):
     powered_diff = diff ** args.RGB_norm
 
     loss=tf.reduce_mean(powered_diff)
+
+    if args.multi_level_loss:
+        nlevels = 9
+        for n in range(nlevels):
+            diff = tf.nn.avg_pool(diff, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
+            if args.RGB_norm % 2 != 0:
+                diff = tf.abs(diff)
+            powered_diff = diff ** args.RGB_norm
+            loss += tf.reduce_mean(powered_diff)
 
     loss_l2 = loss
     loss_add_term = loss
@@ -534,7 +572,6 @@ def main_network(args):
     loss_to_opt = loss + regularizer_loss
 
     if args.optimize_hyperparameter:
-        niters = 150
         var_list = [input_parameters]
         if args.optimizer == 'adam':
             optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
@@ -544,6 +581,8 @@ def main_network(args):
             optimizer = tf.train.AdagradOptimizer(learning_rate=args.learning_rate)
         elif args.optimizer == 'proximal':
             optimizer = tf.train.ProximalGradientDescentOptimizer(learning_rate=args.learning_rate)
+        elif args.optimizer in ['nelder-mead', 'powell']:
+            optimizer = None
         else:
             optimizer = tf.contrib.opt.ScipyOptimizerInterface(loss_to_opt, method=args.optimizer, var_list=var_list, options={'maxiter': niters})
         if args.optimizer in ['adam', 'gradient', 'adagrad', 'proximal']:
@@ -825,28 +864,62 @@ def main_network(args):
             else:
                 grounddir = os.path.join(args.dataroot, 'test_img')
 
-            check_command = 'source activate pytorch36 && CUDA_VISIBLE_DEVICES=2, python plot_clip_weights.py ' + test_dirname + ' ' + grounddir + ' && source activate tensorflow35'
+            check_command = 'source activate pytorch36 && CUDA_VISIBLE_DEVICES=2, python plot_clip_weights.py ' + test_dirname + ' ' + grounddir + ' && source activate tensorflow36'
             subprocess.check_output(check_command, shell=True)
     else:
-        if args.input_img != '' and args.output_img != '':
-            feed_dict = {}
-            feed_dict[input] = np.expand_dims(read_name(args.input_img, False), axis=0)
-            feed_dict[output] = np.expand_dims(read_name(args.output_img, False), axis=0)
-            convergence = -numpy.ones(niters)
-            idx = 0
+        idx = 0
+        def loss_callback_functor(convergence_vec, is_scipy=False, func=None):
             def loss_callback(eval_loss):
                 nonlocal idx
-                convergence[idx] = eval_loss
+                convergence_vec[idx] = eval_loss
                 print(idx, eval_loss * 255 * 255)
                 idx += 1
-            if regular_optimize:
+            if not is_scipy:
+                return loss_callback
+            else:
+                assert func is not None
+                def callback(x):
+                    loss_callback(func(x))
+                return callback
+
+        if optimizer is None:
+            def scipy_objective_functor(feed_dict):
+                def objective(x):
+                    feed_dict[input_parameters] = x
+                    ans = sess.run(loss, feed_dict=feed_dict)
+                    return ans
+                return objective
+
+        if (args.input_img != '' or not args.use_input_img) and args.output_img != '':
+            feed_dict = {}
+            if args.use_input_img:
+                input_img = read_name(args.input_img, False)
+                feed_dict[input] = numpy.expand_dims(input_img, axis=0)
+            output_img = read_name(args.output_img, False)
+            feed_dict[output] = numpy.expand_dims(output_img, axis=0)
+            convergence = -numpy.ones(niters)
+            if optimizer is None:
+                # do not use scipy interface in tensorflow
+                # to make sure that gradient information is not used during optimization
+                x0 = numpy.random.rand(args.input_nc)
+                if args.orig_program_name == 'local_laplacian_tf':
+                    x0[2] *= 0.1
+                objective = scipy_objective_functor(feed_dict)
+                res = scipy.optimize.minimize(objective, x0, method=args.optimizer, callback=loss_callback_functor(convergence, True, objective), options={'disp': True, 'maxiter': niters})
+                print(res)
+            elif regular_optimize:
                 for i in range(niters):
                     _, current = sess.run([opt, loss], feed_dict=feed_dict)
                     print(i, current * 255 * 255)
                     convergence[i] = current * 255 * 255
             else:
-                optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback)
-            optimized_parameters, img, current = sess.run([input_parameters, network, loss], feed_dict=feed_dict)
+                optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback_functor(convergence))
+            if optimizer is None:
+                optimized_parameters = res.x
+                feed_dict[input_parameters] = optimized_parameters
+            else:
+                optimized_parameters = sess.run(input_parameters, feed_dict=feed_dict)
+            img, current = sess.run([network, loss], feed_dict=feed_dict)
             print(current * 255.0 * 255.0)
             numpy.save('%s/%s_%s_convergence%s.npy'%(args.name, args.optimize_prefix, args.optimizer, '_orig' if args.use_orig_program else ''), convergence)
             numpy.save('%s/%s_%s_optimized_parameters%s.npy'%(args.name, args.optimize_prefix, args.optimizer, '_orig' if args.use_orig_program else ''), optimized_parameters)
@@ -857,6 +930,8 @@ def main_network(args):
             else:
                 dirbase = args.test_dirname
             optimize_dirname = '%s/optimize_%s%s'%(args.name, dirbase, '_orig' if args.use_orig_program else '')
+            if optimizer is None:
+                optimize_dirname += '_%s'%args.optimizer
 
             if not os.path.isdir(optimize_dirname):
                 os.makedirs(optimize_dirname)
@@ -871,11 +946,6 @@ def main_network(args):
             for ind in range(len(val_names)):
                 idx = 0
                 feed_dict = {}
-                def loss_callback(eval_loss):
-                    nonlocal idx
-                    convergence[ind, idx] = eval_loss
-                    print(idx, eval_loss * 255 * 255)
-                    idx += 1
                 if args.preload:
                     input_image = eval_images[ind]
                     output_image = eval_out_images[ind]
@@ -886,16 +956,31 @@ def main_network(args):
                     continue
                 feed_dict[input] = input_image
                 feed_dict[output] = output_image
-                if regular_optimize:
+                x0 = numpy.random.rand(args.input_nc)
+                if args.orig_program_name == 'local_laplacian_tf':
+                    x0[2] *= 0.1
+                if optimizer is not None:
+                    sess.run(tf.assign(input_parameters, x0))
+                if optimizer is None:
+                    objective = scipy_objective_functor(feed_dict)
+                    res = scipy.optimize.minimize(objective, x0, method=args.optimizer, callback=loss_callback_functor(convergence[ind, :], True, objective), options={'disp': True, 'maxiter': niters})
+                    print(res)
+                    iters_used[ind] = idx
+                elif regular_optimize:
                     for i in range(niters):
                         _, current = sess.run([opt, loss], feed_dict=feed_dict)
                         print(i, current * 255 * 255)
                         convergence[ind, i] = current * 255 * 255
                     iters_used[ind] = i
                 else:
-                    optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback)
+                    optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback_functor(convergence[ind, :]))
                     iters_used[ind] = idx
-                optimized_parameters, img, current = sess.run([input_parameters, network, loss], feed_dict=feed_dict)
+                if optimizer is None:
+                    optimized_parameters = res.x
+                    feed_dict[input_parameters] = optimized_parameters
+                else:
+                    optimized_parameters = sess.run(input_parameters, feed_dict=feed_dict)
+                img, current = sess.run([network, loss], feed_dict=feed_dict)
                 cv2.imwrite('%s/%06d.png'%(optimize_dirname, ind), np.uint8(np.clip(img[0, :, :, :], 0.0, 1.0) * 255.0))
                 loss_record[ind] = current * 255.0 * 255.0
                 parameters_stored[ind, :] = optimized_parameters[:]

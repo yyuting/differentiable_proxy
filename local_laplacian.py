@@ -4,10 +4,10 @@ import skimage.io
 import skimage.color
 import sys
 
-def local_laplacian(input_img, alpha=1.0 / 7.0, beta=1.0, eps=0.01):
+def local_laplacian(input_img, alpha=1.0 / 7.0, beta=1.0, eps=0.01, levels=8, J=8):
 
-    levels = 8
-    J = 8
+    levels = int(levels)
+    J = int(J)
 
     gray = 0.299 * input_img[:, :, 0] + 0.587 * input_img[:, :, 1] + 0.114 * input_img[:, :, 2]
 
