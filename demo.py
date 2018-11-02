@@ -249,6 +249,8 @@ def main():
     parser.add_argument('--grayscale', dest='grayscale', action='store_true', help='if specified, output grayscale image instead of color image')
     parser.add_argument('--multi_level_loss', dest='multi_level_loss', action='store_true', help='if specified, use a multiple level loss')
     parser.add_argument('--orig_program_name', dest='orig_program_name', default='local_laplacian_tf', help='specify the original program name for optimization')
+    parser.add_argument('--fc', dest='fc', action='store_true', help='if specified, use fully connected network')
+    parser.add_argument('--batch_size', dest='batch_size', type=int, default=1, help='batch size used for training/testing.')
 
     parser.set_defaults(is_npy=False)
     parser.set_defaults(is_train=False)
@@ -287,6 +289,7 @@ def main():
     parser.set_defaults(force_training_mode=False)
     parser.set_defaults(optimize_hyperparameter=False)
     parser.set_defaults(use_orig_program=False)
+    parser.set_defaults(fc=False)
 
     args = parser.parse_args()
 
@@ -313,6 +316,7 @@ def copy_option(args):
     delattr(new_args, 'inference_loss')
     delattr(new_args, 'test_dirname')
     delattr(new_args, 'orig_program_name')
+    delattr(new_args, 'batch_size')
     return new_args
 
 def main_network(args):
@@ -379,12 +383,19 @@ def main_network(args):
     global less_aggresive_ini
     less_aggresive_ini = args.less_aggresive_ini
 
-    input_names, output_names, val_names, val_img_names, validate_names, validate_img_names, map_names, val_map_names, grad_names, val_grad_names = prepare_data_root(args.dataroot, gradient_loss=args.gradient_loss)
-    if args.test_training:
-        val_names = input_names
-        val_img_names = output_names
-        val_map_names = map_names
-        val_grad_names = grad_names
+    if not args.fc:
+        input_names, output_names, val_names, val_img_names, validate_names, validate_img_names, map_names, val_map_names, grad_names, val_grad_names = prepare_data_root(args.dataroot, gradient_loss=args.gradient_loss)
+        if args.test_training:
+            val_names = input_names
+            val_img_names = output_names
+            val_map_names = map_names
+            val_grad_names = grad_names
+        assert args.batch_size == 1
+    else:
+        train_label = numpy.load(os.path.join(args.dataroot, 'train_label.npy'))
+        train_val = numpy.load(os.path.join(args.dataroot, 'train_val.npy'))
+        test_label = numpy.load(os.path.join(args.dataroot, 'test_label.npy'))
+        test_val = numpy.load(os.path.join(args.dataroot, 'test_val.npy'))
 
     def read_ind(img_arr, name_arr, id, is_npy):
         img_arr[id] = read_name(name_arr[id], is_npy)
@@ -415,27 +426,32 @@ def main_network(args):
 
     niters = 150
 
-    if args.grayscale:
-        img_ch = 1
+    if not args.fc:
+        if args.grayscale:
+            img_ch = 1
+        else:
+            img_ch = 3
+        input=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
+        output=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
+        if args.optimize_hyperparameter and (args.optimizer not in ['nelder-mead', 'powell']):
+            ini_parameters = numpy.random.rand(args.input_nc)
+            # a hack because eps is not correctly scaled during training
+            if args.orig_program_name == 'local_laplacian_tf':
+                ini_parameters[2] *= 0.1
+            input_parameters = tf.Variable(ini_parameters, dtype=tf.float32, name='input_parameters')
+        else:
+            input_parameters = tf.placeholder(tf.float32, shape=args.input_nc)
+        filled = []
+        for i in range(args.input_nc):
+            filled.append(tf.expand_dims(tf.fill(tf.shape(output)[:3], input_parameters[i]), axis=3))
+        if args.use_input_img:
+            input_to_network = tf.concat([input]+filled, axis=3)
+        else:
+            input_to_network = tf.concat(filled, axis=3)
     else:
-        img_ch = 3
-    input=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
-    output=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
-    if args.optimize_hyperparameter and (args.optimizer not in ['nelder-mead', 'powell']):
-        ini_parameters = numpy.random.rand(args.input_nc)
-        # a hack because eps is not correctly scaled during training
-        if args.orig_program_name == 'local_laplacian_tf':
-            ini_parameters[2] *= 0.1
-        input_parameters = tf.Variable(ini_parameters, dtype=tf.float32, name='input_parameters')
-    else:
-        input_parameters = tf.placeholder(tf.float32, shape=args.input_nc)
-    filled = []
-    for i in range(args.input_nc):
-        filled.append(tf.expand_dims(tf.fill(tf.shape(output)[:3], input_parameters[i]), axis=3))
-    if args.use_input_img:
-        input_to_network = tf.concat([input]+filled, axis=3)
-    else:
-        input_to_network = tf.concat(filled, axis=3)
+        input = tf.placeholder(tf.float32, [None, args.input_nc])
+        output = tf.placeholder(tf.float32, [None, 1])
+        input_to_network = input
 
     with tf.control_dependencies([input_to_network]):
         if args.use_orig_program:
@@ -446,7 +462,20 @@ def main_network(args):
                 network = local_laplacian_categorical(input, input_parameters[0], input_parameters[1], input_parameters[2], input_parameters[3], input_parameters[4])
             regularizer_loss = 0
             manual_regularize = 0
-        elif not args.unet:
+        elif args.unet:
+            with tf.variable_scope("unet"):
+                network, intermediate_layers = unet(input_to_network, args.unet_base_channel, args.update_bn, batch_norm_is_training)
+                regularizer_loss = 0
+                manual_regularize = 0
+        elif args.fc:
+            with tf.variable_scope("fc"):
+                network = input_to_network
+                #slim.stack(network, slim.fully_connected, [32, 64, 128, 1], activation_fn=lrelu)
+                for neuron in [32, 64, 128, 256, 128, 64, 32, 1]:
+                    network = slim.fully_connected(network, neuron, activation_fn=lrelu)
+                regularizer_loss = 0.0
+                manual_regularize = 0
+        else:
             if 3 + args.input_nc <= actual_conv_channel:
                 ini_id = True
             else:
@@ -487,12 +516,6 @@ def main_network(args):
                         input_to_network = slim.conv2d(input_to_network, actual_initial_layer_channels, [1, 1], rate=1, activation_fn=lrelu, normalizer_fn=nm, weights_initializer=identity_initializer(), scope='initial_'+str(nlayer), weights_regularizer=regularizer)
 
             network=build(input_to_network, ini_id, regularizer_scale=args.regularizer_scale, final_layer_channels=args.final_layer_channels, identity_initialize=args.identity_initialize, grayscale=args.grayscale)
-
-        else:
-            with tf.variable_scope("unet"):
-                network, intermediate_layers = unet(input_to_network, args.unet_base_channel, args.update_bn, batch_norm_is_training)
-                regularizer_loss = 0
-                manual_regularize = 0
 
     if not args.train_res:
         diff = network - output
@@ -638,17 +661,21 @@ def main_network(args):
         num_epoch = args.epoch
         #assert num_epoch % save_frequency == 0
 
-        if args.is_train or args.test_training:
-            parameters = np.load(os.path.join(args.dataroot, 'train.npy'))
-        else:
-            parameters = np.load(os.path.join(args.dataroot, 'test.npy'))
+        if not args.fc:
+            if args.is_train or args.test_training:
+                parameters = np.load(os.path.join(args.dataroot, 'train.npy'))
+            else:
+                parameters = np.load(os.path.join(args.dataroot, 'test.npy'))
 
         print("arriving before train branch")
 
         if args.is_train:
-            all=np.zeros(len(input_names), dtype=float)
+            if not args.fc:
+                all=np.zeros(len(input_names), dtype=float)
+            else:
+                all = numpy.zeros(train_label.shape[0], dtype=float)
 
-            if read_data_from_file and args.preload:
+            if read_data_from_file and args.preload and not args.fc:
                 input_images=[None]*len(input_names)
                 output_images=[None]*len(input_names)
 
@@ -672,8 +699,12 @@ def main_network(args):
 
                 cnt=0
 
-                permutation = np.random.permutation(len(input_names))
-                nupdates = len(input_names)
+                if args.fc:
+                    dataset_len = train_label.shape[0]
+                else:
+                    dataset_len = len(input_names)
+                permutation = np.random.permutation(dataset_len)
+                nupdates = int(numpy.ceil(dataset_len / args.batch_size))
 
                 for i in range(nupdates):
                     st=time.time()
@@ -689,23 +720,34 @@ def main_network(args):
                             feed_dict[dx_ground] = grad_arr[:, :, :, 1:4]
                             feed_dict[dy_ground] = grad_arr[:, :, :, 4:]
 
-                    if args.preload:
-                        input_image = input_images[permutation[i]]
-                        output_image = output_images[permutation[i]]
-                        if input_image is None:
-                            continue
-                    else:
-                        input_image = np.expand_dims(read_name(input_names[permutation[i]], args.is_npy, args.is_bin), axis=0)
-                        output_image = np.expand_dims(read_name(output_names[permutation[i]], False), axis=0)
+                    if not args.fc:
+                        if args.preload:
+                            input_image = input_images[permutation[i]]
+                            output_image = output_images[permutation[i]]
+                            if input_image is None:
+                                continue
+                        else:
+                            input_image = np.expand_dims(read_name(input_names[permutation[i]], args.is_npy, args.is_bin), axis=0)
+                            output_image = np.expand_dims(read_name(output_names[permutation[i]], False), axis=0)
 
-                    feed_dict[input] = input_image
-                    feed_dict[input_parameters] = parameters[:, permutation[i]]
-                    feed_dict[output] = output_image
+                        feed_dict[input] = input_image
+                        feed_dict[input_parameters] = parameters[:, permutation[i]]
+                        feed_dict[output] = output_image
+                    else:
+                        start_ind = i * args.batch_size
+                        end_ind = min((i + 1) * args.batch_size, permutation.shape[0])
+                        feed_dict[input] = train_label[permutation[start_ind:end_ind], :]
+                        feed_dict[output] = numpy.expand_dims(train_val[permutation[start_ind:end_ind]], axis=1)
+
                     _,current=sess.run([opt,loss],feed_dict=feed_dict)
 
-                    all[permutation[i]]=current*255.0*255.0
+                    if args.batch_size == 1:
+                        current *= 255.0 * 255.0
+                        all[permutation[i]]=current
+                    else:
+                        all[permutation[start_ind:end_ind]] = current
                     cnt += 1
-                    print("%d %d %.2f %.2f %.2f %s"%(epoch,cnt,current*255.0*255.0,np.mean(all[np.where(all)]),time.time()-st,os.getcwd().split('/')[-2]))
+                    print("%d %d %.2f %.2f %.2f %s"%(epoch,cnt,current,np.mean(all[np.where(all)]),time.time()-st,os.getcwd().split('/')[-2]))
 
                 avg_loss = np.mean(all[np.where(all)])
 
@@ -778,7 +820,7 @@ def main_network(args):
             if not os.path.exists('%s/var_only'%args.name):
                 os.makedirs('%s/var_only'%args.name)
             saver_vars_only.save(sess, "%s/var_only/model.ckpt"%args.name)
-            if args.preload:
+            if args.preload and not args.fc:
                 eval_images = [None] * len(val_names)
                 eval_out_images = [None] * len(val_names)
                 for id in range(len(val_names)):
@@ -799,8 +841,12 @@ def main_network(args):
             if not os.path.isdir(test_dirname):
                 os.makedirs(test_dirname)
 
-            all_test=np.zeros(len(val_names), dtype=float)
-            for ind in range(len(val_names)):
+            if args.fc:
+                test_len = test_label.shape[0]
+            else:
+                test_len = len(val_names)
+            all_test=np.zeros(test_len, dtype=float)
+            for ind in range(test_len):
                 if args.generate_timeline:
                     run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                     run_metadata = tf.RunMetadata()
@@ -808,45 +854,51 @@ def main_network(args):
                     run_options = None
                     run_metadata = None
                 feed_dict = {}
-                if args.preload:
-                    input_image = eval_images[ind]
-                    output_image = eval_out_images[ind]
-                else:
-                    input_image = np.expand_dims(read_name(val_names[ind], args.is_npy, args.is_bin), axis=0)
-                    output_image = np.expand_dims(read_name(val_img_names[ind], False, False), axis=0)
-                if input_image is None:
-                    continue
-                st=time.time()
-                if args.specific_par != '':
-                    specific_parameters = args.specific_par.split(',')
-                    specific_parameters = numpy.array([float(item) for item in specific_parameters])
-                    feed_dict[input] = np.expand_dims(read_name(args.input_img, False), axis=0)
-                    feed_dict[output] = np.expand_dims(read_name(args.output_img, False), axis=0)
-                    feed_dict[input_parameters] = specific_parameters
-                else:
-                    feed_dict[input] = input_image
-                    feed_dict[output] = output_image
-                    feed_dict[input_parameters] = parameters[:, ind]
-
-                if args.gradient_loss:
-                    grad_arr = read_name(val_grad_names[ind], True)
-                    feed_dict[canny_edge] = grad_arr[:, :, :, 0]
-                    if args.grayscale_grad:
-                        feed_dict[dx_ground] = grad_arr[:, :, :, 1:2]
-                        feed_dict[dy_ground] = grad_arr[:, :, :, 2:3]
+                if not args.fc:
+                    if args.preload:
+                        input_image = eval_images[ind]
+                        output_image = eval_out_images[ind]
                     else:
-                        feed_dict[dx_ground] = grad_arr[:, :, :, 1:4]
-                        feed_dict[dy_ground] = grad_arr[:, :, :, 4:]
+                        input_image = np.expand_dims(read_name(val_names[ind], args.is_npy, args.is_bin), axis=0)
+                        output_image = np.expand_dims(read_name(val_img_names[ind], False, False), axis=0)
+                    if input_image is None:
+                        continue
+                    if args.specific_par != '':
+                        specific_parameters = args.specific_par.split(',')
+                        specific_parameters = numpy.array([float(item) for item in specific_parameters])
+                        feed_dict[input] = np.expand_dims(read_name(args.input_img, False), axis=0)
+                        feed_dict[output] = np.expand_dims(read_name(args.output_img, False), axis=0)
+                        feed_dict[input_parameters] = specific_parameters
+                    else:
+                        feed_dict[input] = input_image
+                        feed_dict[output] = output_image
+                        feed_dict[input_parameters] = parameters[:, ind]
+
+                    if args.gradient_loss:
+                        grad_arr = read_name(val_grad_names[ind], True)
+                        feed_dict[canny_edge] = grad_arr[:, :, :, 0]
+                        if args.grayscale_grad:
+                            feed_dict[dx_ground] = grad_arr[:, :, :, 1:2]
+                            feed_dict[dy_ground] = grad_arr[:, :, :, 2:3]
+                        else:
+                            feed_dict[dx_ground] = grad_arr[:, :, :, 1:4]
+                            feed_dict[dy_ground] = grad_arr[:, :, :, 4:]
+                else:
+                    feed_dict[input] = test_label[ind:ind+1, :]
+                    feed_dict[output] = numpy.expand_dims(test_val[ind:ind+1], axis=1)
+                st=time.time()
                 output_image, current=sess.run([network, loss_l2],feed_dict=feed_dict, options=run_options, run_metadata=run_metadata)
                 print("%.3f"%(time.time()-st))
-                all_test[ind] = current * 255.0 * 255.0
-                output_image=np.minimum(np.maximum(output_image,0.0),1.0)*255.0
-                if args.specific_par != '':
-                    cv2.imwrite('%s/%s.png'%(args.name, args.optimize_prefix), np.uint8(output_image[0,:,:,:]))
-                    print(current * 255.0 * 255.0)
-                    sess.close()
-                    return
-                cv2.imwrite("%s/%06d.png"%(test_dirname, ind),np.uint8(output_image[0,:,:,:]))
+                if not args.fc:
+                    current *= 255.0 * 255.0 * 255.0
+                    output_image=np.minimum(np.maximum(output_image,0.0),1.0)*255.0
+                    if args.specific_par != '':
+                        cv2.imwrite('%s/%s.png'%(args.name, args.optimize_prefix), np.uint8(output_image[0,:,:,:]))
+                        print(current * 255.0 * 255.0)
+                        sess.close()
+                        return
+                    cv2.imwrite("%s/%06d.png"%(test_dirname, ind),np.uint8(output_image[0,:,:,:]))
+                all_test[ind] = current
                 if args.generate_timeline:
                     fetched_timeline = timeline.Timeline(run_metadata.step_stats)
                     chrome_trace = fetched_timeline.generate_chrome_trace_format()
@@ -859,13 +911,14 @@ def main_network(args):
             numpy.savetxt(os.path.join(test_dirname, 'l2_all.txt'), all_test[np.where(all_test)], fmt="%f, ")
             numpy.save(os.path.join(test_dirname, 'l2_all.npy'), all_test[np.where(all_test)])
 
-            if args.test_training:
-                grounddir = os.path.join(args.dataroot, 'train_img')
-            else:
-                grounddir = os.path.join(args.dataroot, 'test_img')
+            if not args.fc:
+                if args.test_training:
+                    grounddir = os.path.join(args.dataroot, 'train_img')
+                else:
+                    grounddir = os.path.join(args.dataroot, 'test_img')
 
-            check_command = 'source activate pytorch36 && CUDA_VISIBLE_DEVICES=2, python plot_clip_weights.py ' + test_dirname + ' ' + grounddir + ' && source activate tensorflow36'
-            subprocess.check_output(check_command, shell=True)
+                check_command = 'source activate pytorch36 && CUDA_VISIBLE_DEVICES=2, python plot_clip_weights.py ' + test_dirname + ' ' + grounddir + ' && source activate tensorflow36'
+                subprocess.check_output(check_command, shell=True)
     else:
         idx = 0
         def loss_callback_functor(convergence_vec, is_scipy=False, func=None):
