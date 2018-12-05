@@ -17,6 +17,7 @@ import subprocess
 import shutil
 from local_laplacian_tf import local_laplacian_tf
 from local_laplacian import local_laplacian
+import bayesian_optimization
 import skimage.io
 import scipy
 import scipy.optimize
@@ -251,6 +252,7 @@ def main():
     parser.add_argument('--orig_program_name', dest='orig_program_name', default='local_laplacian_tf', help='specify the original program name for optimization')
     parser.add_argument('--fc', dest='fc', action='store_true', help='if specified, use fully connected network')
     parser.add_argument('--batch_size', dest='batch_size', type=int, default=1, help='batch size used for training/testing.')
+    parser.add_argument('--direct_scipy_optimize', dest='direct_scipy_optimize', action='store_true', help='if specified, use scipy optimization directly, (not using scipy wrapper in tensorflow) for comparable timing')
 
     parser.set_defaults(is_npy=False)
     parser.set_defaults(is_train=False)
@@ -290,6 +292,7 @@ def main():
     parser.set_defaults(optimize_hyperparameter=False)
     parser.set_defaults(use_orig_program=False)
     parser.set_defaults(fc=False)
+    parser.set_defaults(direct_scipy_optimize=False)
 
     args = parser.parse_args()
 
@@ -317,6 +320,7 @@ def copy_option(args):
     delattr(new_args, 'test_dirname')
     delattr(new_args, 'orig_program_name')
     delattr(new_args, 'batch_size')
+    delattr(new_args, 'direct_scipy_optimize')
     return new_args
 
 def main_network(args):
@@ -433,7 +437,9 @@ def main_network(args):
             img_ch = 3
         input=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
         output=tf.placeholder(tf.float32,shape=[None,None,None,img_ch])
-        if args.optimize_hyperparameter and (args.optimizer not in ['nelder-mead', 'powell']):
+        #if args.optimize_hyperparameter and (args.optimizer not in ['nelder-mead', 'powell']):
+        #if args.optimize_hyperparameter and (args.optimizer in ['adam', 'gradient', 'adagrad', 'proximal']):
+        if args.optimize_hyperparameter and (not args.direct_scipy_optimize):
             ini_parameters = numpy.random.rand(args.input_nc)
             # a hack because eps is not correctly scaled during training
             if args.orig_program_name == 'local_laplacian_tf':
@@ -449,7 +455,17 @@ def main_network(args):
         else:
             input_to_network = tf.concat(filled, axis=3)
     else:
-        input = tf.placeholder(tf.float32, [None, args.input_nc])
+        if not args.optimize_hyperparameter:
+            input = tf.placeholder(tf.float32, [None, args.input_nc])
+        else:
+            #if args.optimizer in ['adam', 'gradient', 'adagrad', 'proximal']:
+            if not args.direct_scipy_optimize:
+                ini_parameters = numpy.random.rand(args.input_nc)
+                input_parameters = tf.Variable(ini_parameters, dtype=tf.float32, name='input_parameters')
+            else:
+                input_parameters = tf.placeholder(tf.float32, shape=args.input_nc)
+            input = tf.expand_dims(input_parameters, axis=0)
+
         output = tf.placeholder(tf.float32, [None, 1])
         input_to_network = input
 
@@ -460,6 +476,10 @@ def main_network(args):
             elif args.orig_program_name == 'local_laplacian_categorical':
                 from local_laplacian_categorical import local_laplacian_categorical
                 network = local_laplacian_categorical(input, input_parameters[0], input_parameters[1], input_parameters[2], input_parameters[3], input_parameters[4])
+            elif args.orig_program_name == 'ackley':
+                network = bayesian_optimization.ackley(input, args.input_nc)
+            elif args.orig_program_name == 'laplacian_nlmeans':
+                network = 0
             regularizer_loss = 0
             manual_regularize = 0
         elif args.unet:
@@ -604,10 +624,14 @@ def main_network(args):
             optimizer = tf.train.AdagradOptimizer(learning_rate=args.learning_rate)
         elif args.optimizer == 'proximal':
             optimizer = tf.train.ProximalGradientDescentOptimizer(learning_rate=args.learning_rate)
-        elif args.optimizer in ['nelder-mead', 'powell']:
-            optimizer = None
-        else:
+        elif not args.direct_scipy_optimize:
             optimizer = tf.contrib.opt.ScipyOptimizerInterface(loss_to_opt, method=args.optimizer, var_list=var_list, options={'maxiter': niters})
+        else:
+            optimizer = None
+        #elif args.optimizer in ['nelder-mead', 'powell']:
+        #    optimizer = None
+        #else:
+        #    optimizer = tf.contrib.opt.ScipyOptimizerInterface(loss_to_opt, method=args.optimizer, var_list=var_list, options={'maxiter': niters})
         if args.optimizer in ['adam', 'gradient', 'adagrad', 'proximal']:
             opt = optimizer.minimize(loss_to_opt,var_list=var_list)
             regular_optimize = True
@@ -890,7 +914,8 @@ def main_network(args):
                 output_image, current=sess.run([network, loss_l2],feed_dict=feed_dict, options=run_options, run_metadata=run_metadata)
                 print("%.3f"%(time.time()-st))
                 if not args.fc:
-                    current *= 255.0 * 255.0 * 255.0
+                    current *= 255.0 * 255.0
+                    print(current)
                     output_image=np.minimum(np.maximum(output_image,0.0),1.0)*255.0
                     if args.specific_par != '':
                         cv2.imwrite('%s/%s.png'%(args.name, args.optimize_prefix), np.uint8(output_image[0,:,:,:]))
@@ -924,7 +949,8 @@ def main_network(args):
         def loss_callback_functor(convergence_vec, is_scipy=False, func=None):
             def loss_callback(eval_loss):
                 nonlocal idx
-                convergence_vec[idx] = eval_loss
+                if idx < convergence_vec.shape[0]:
+                    convergence_vec[idx] = eval_loss
                 print(idx, eval_loss * 255 * 255)
                 idx += 1
             if not is_scipy:
@@ -935,13 +961,32 @@ def main_network(args):
                     loss_callback(func(x))
                 return callback
 
+        neval = 0
+
         if optimizer is None:
             def scipy_objective_functor(feed_dict):
+                def img_func(x):
+                    if args.orig_program_name == 'laplacian_nlmeans':
+                        from laplacian_nlmeans import laplacian_nlmeans
+                        out = laplacian_nlmeans(numpy.squeeze(feed_dict[input]), x)
+                    else:
+                        feed_dict[input_parameters] = x
+                        out = sess.run(network, feed_dict=feed_dict)
+                    return out
+
                 def objective(x):
-                    feed_dict[input_parameters] = x
-                    ans = sess.run(loss, feed_dict=feed_dict)
+                    if args.orig_program_name == 'laplacian_nlmeans':
+                        nonlocal neval
+                        print(x)
+                        out = img_func(x)
+                        ans = numpy.mean((out - numpy.squeeze(feed_dict[output])) ** 2.0)
+                        print(neval, ans)
+                        neval += 1
+                    else:
+                        feed_dict[input_parameters] = x
+                        ans = sess.run(loss, feed_dict=feed_dict)
                     return ans
-                return objective
+                return objective, img_func
 
         if (args.input_img != '' or not args.use_input_img) and args.output_img != '':
             feed_dict = {}
@@ -983,36 +1028,53 @@ def main_network(args):
             else:
                 dirbase = args.test_dirname
             optimize_dirname = '%s/optimize_%s%s'%(args.name, dirbase, '_orig' if args.use_orig_program else '')
-            if optimizer is None:
+            if args.optimizer in ['nelder-mead', 'powell']:
                 optimize_dirname += '_%s'%args.optimizer
 
             if not os.path.isdir(optimize_dirname):
                 os.makedirs(optimize_dirname)
 
+            if args.fc:
+                data_len = test_val.shape[0]
+            else:
+                data_len = len(val_names)
+
             # only use the first 100 images
-            if len(val_names) > 100:
+            if not args.fc and data_len > 100:
                 val_names = val_names[:100]
-            convergence = -numpy.ones([len(val_names), niters])
-            loss_record = numpy.zeros(len(val_names))
-            iters_used = numpy.zeros(len(val_names))
-            parameters_stored = numpy.zeros([len(val_names), args.input_nc])
+                data_len = 100
+            nrestarts = 3
+            print(data_len, niters, nrestarts)
+            convergence = -numpy.ones([data_len, niters, nrestarts])
+            loss_record = numpy.zeros([data_len, nrestarts])
+            iters_used = numpy.zeros([data_len, nrestarts])
+            time_used = numpy.zeros([data_len, nrestarts])
+            parameters_stored = numpy.zeros([data_len, args.input_nc])
             convergence_single = numpy.empty(niters)
-            for ind in range(len(val_names)):
+            for ind in range(data_len):
                 feed_dict = {}
-                if args.preload:
-                    input_image = eval_images[ind]
-                    output_image = eval_out_images[ind]
+                if not args.fc:
+                    if args.preload:
+                        input_image = eval_images[ind]
+                        output_image = eval_out_images[ind]
+                    else:
+                        input_image = np.expand_dims(read_name(val_names[ind], args.is_npy, args.is_bin), axis=0)
+                        output_image = np.expand_dims(read_name(val_img_names[ind], False, False), axis=0)
+                    if input_image is None:
+                        continue
+                    feed_dict[input] = input_image
+                    feed_dict[output] = output_image
                 else:
-                    input_image = np.expand_dims(read_name(val_names[ind], args.is_npy, args.is_bin), axis=0)
-                    output_image = np.expand_dims(read_name(val_img_names[ind], False, False), axis=0)
-                if input_image is None:
-                    continue
-                feed_dict[input] = input_image
-                feed_dict[output] = output_image
-                nrestarts = 3
+                    feed_dict[output] = numpy.expand_dims(test_val[ind:ind+1], axis=1)
+
                 min_current = 1e8
                 min_current_iters = -1
-                for _ in range(nrestarts):
+
+                if optimizer is None:
+                    objective, get_img = scipy_objective_functor(feed_dict)
+
+                for k in range(nrestarts):
+                    time_start = time.time()
                     idx = 0
                     convergence_single[:] = -1
                     x0 = numpy.random.rand(args.input_nc)
@@ -1021,43 +1083,58 @@ def main_network(args):
                     if optimizer is not None:
                         sess.run(tf.assign(input_parameters, x0))
                     if optimizer is None:
-                        objective = scipy_objective_functor(feed_dict)
                         res = scipy.optimize.minimize(objective, x0, method=args.optimizer, callback=loss_callback_functor(convergence_single, True, objective), options={'disp': True, 'maxiter': niters})
-                        print(res)
-                        iters_used[ind] = idx
+                        #print(res)
+                        iters_used[ind, k] = idx
                     elif regular_optimize:
                         for i in range(niters):
                             _, current = sess.run([opt, loss], feed_dict=feed_dict)
-                            print(i, current * 255 * 255)
+                            #print(i, current * 255 * 255)
                             convergence_single[i] = current * 255 * 255
                             #convergence[ind, i] = current * 255 * 255
-                        iters_used[ind] = i
+                        iters_used[ind, k] = i
                     else:
                         optimizer.minimize(sess, feed_dict=feed_dict, fetches=[loss], loss_callback=loss_callback_functor(convergence_single))
-                        iters_used[ind] = idx
+                        iters_used[ind, k] = idx
                     if optimizer is None:
                         optimized_parameters = res.x
                         feed_dict[input_parameters] = optimized_parameters
                     else:
                         optimized_parameters = sess.run(input_parameters, feed_dict=feed_dict)
                     current = sess.run(loss, feed_dict=feed_dict)
+                    time_end = time.time()
+                    time_used[ind, k] = time_end - time_start
+                    convergence[ind, :, k] = convergence_single[:]
+                    loss_record[ind, k] = current * 255 * 255
+                    print(ind, k, iters_used[ind], current * 255 * 255)
                     if current < min_current:
                         min_current = current
-                        convergence[ind, :] = convergence_single[:]
                         min_current_iters = iters_used[ind]
                         parameters_stored[ind, :] = optimized_parameters[:]
+
+                    numpy.save('%s/convergence.npy'%(optimize_dirname), convergence)
+                    numpy.save('%s/loss_record.npy'%(optimize_dirname), loss_record)
+                    numpy.save('%s/iters_used.npy'%(optimize_dirname), iters_used)
+                    numpy.save('%s/parameters_stored.npy'%(optimize_dirname), parameters_stored)
+                    numpy.save('%s/time.npy'%(optimize_dirname), time_used)
 
                 if optimizer is None:
                     feed_dict[input_parameters] = parameters_stored[ind, :]
                 else:
                     sess.run(tf.assign(input_parameters, parameters_stored[ind, :]))
-                img = sess.run(network, feed_dict=feed_dict)
-                cv2.imwrite('%s/%06d.png'%(optimize_dirname, ind), np.uint8(np.clip(img[0, :, :, :], 0.0, 1.0) * 255.0))
-                loss_record[ind] = min_current * 255.0 * 255.0
+                if not args.fc:
+                    #img = sess.run(network, feed_dict=feed_dict)
+                    if optimizer is None:
+                        img = get_img(parameters_stored[ind, :])
+                    else:
+                        img = sess.run(network, feed_dict=feed_dict)
+                    cv2.imwrite('%s/%06d.png'%(optimize_dirname, ind), np.uint8(np.clip(img[0, :, :, :], 0.0, 1.0) * 255.0))
+                #loss_record[ind] = min_current * 255.0 * 255.0
             numpy.save('%s/convergence.npy'%(optimize_dirname), convergence)
             numpy.save('%s/loss_record.npy'%(optimize_dirname), loss_record)
             numpy.save('%s/iters_used.npy'%(optimize_dirname), iters_used)
             numpy.save('%s/parameters_stored.npy'%(optimize_dirname), parameters_stored)
+            numpy.save('%s/time.npy'%(optimize_dirname), time_used)
 
     sess.close()
 
