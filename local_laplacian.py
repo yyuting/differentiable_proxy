@@ -110,5 +110,5 @@ def local_laplacian(input_img, alpha=1.0 / 7.0, beta=1.0, eps=0.01, levels=8, J=
 
     return output_img
 
-img = skimage.img_as_float(skimage.io.imread('/home/yy2bb/test_images/Images_cropped_256/000000.png'))
-arr = local_laplacian(img)
+#img = skimage.img_as_float(skimage.io.imread('/home/yy2bb/test_images/Images_cropped_256/000000.png'))
+#arr = local_laplacian(img)
