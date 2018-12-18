@@ -34,6 +34,8 @@ identity_output_layer = True
 
 less_aggresive_ini = False
 
+allowed_img_ext = ['jpg', 'png']
+
 def lrelu(x):
     return tf.maximum(x*0.2,x)
 
@@ -159,7 +161,9 @@ def prepare_data_root(dataroot, gradient_loss=False):
                          (validate_input_dir, validate_names),
                          (validate_output_dir, validate_img_names)]:
         for file in sorted(os.listdir(dir)):
-            names.append(os.path.join(dir, file))
+            _, ext = os.path.splitext(file)
+            if ext in allowed_img_ext:
+                names.append(os.path.join(dir, file))
 
     if gradient_loss:
         train_grad_dir = os.path.join(dataroot, 'train_grad')
@@ -869,6 +873,8 @@ def main_network(args):
                 test_len = test_label.shape[0]
             else:
                 test_len = len(val_names)
+
+            assert test_len <= parameters.shape[1]
             all_test=np.zeros(test_len, dtype=float)
             for ind in range(test_len):
                 if args.generate_timeline:
