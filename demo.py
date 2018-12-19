@@ -874,7 +874,8 @@ def main_network(args):
             else:
                 test_len = len(val_names)
 
-            assert test_len <= parameters.shape[1]
+            if not args.fc:
+                assert test_len <= parameters.shape[1]
             all_test=np.zeros(test_len, dtype=float)
             for ind in range(test_len):
                 if args.generate_timeline:
