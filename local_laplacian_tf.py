@@ -12,10 +12,10 @@ os.system('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free >tmp')
 os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmax([int(x.split()[2]) for x in open('tmp','r').readlines()]))
 os.system('rm tmp')
 
-def local_laplacian_tf(input_img, alpha=1.0 / 7.0, beta=1.0, eps=0.01, feed_dict=None):
+def local_laplacian_tf(input_img, alpha=1.0 / 7.0, beta=1.0, eps=0.01, levels=8, J=8, feed_dict=None):
     # assume input_img = tf.placeholder([1, None, None, 3])
-    levels = 8
-    J = 8
+    levels = int(levels)
+    J = int(J)
 
     # gray dim: [1, None, None]
     gray = 0.299 * input_img[:, :, :, 0] + 0.587 * input_img[:, :, :, 1] + 0.114 * input_img[:, :, :, 2]

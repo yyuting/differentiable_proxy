@@ -34,7 +34,7 @@ identity_output_layer = True
 
 less_aggresive_ini = False
 
-allowed_img_ext = ['jpg', 'png']
+allowed_img_ext = ['.jpg', '.png']
 
 def lrelu(x):
     return tf.maximum(x*0.2,x)
